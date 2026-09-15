@@ -58,7 +58,7 @@ def load_monthly_returns(file_path: str) -> pd.DataFrame:
 
     Raises a clear, non-traceback error if the file or sheet layout is wrong.
     """
-    print(f"[1/5] Loading data from: {file_path}")
+    print(f"[1/6] Loading data from: {file_path}")
 
     if not os.path.isfile(file_path):
         raise DataLayoutError(
@@ -124,13 +124,20 @@ def apply_data_quality_gate(df: pd.DataFrame) -> pd.DataFrame:
     Keep only columns (stocks) with a complete, numeric 36-month series.
     Prints how many were kept/excluded and lists excluded names.
     """
-    print("[2/5] Applying data quality gate (complete numeric series only)...")
+    print("[2/6] Applying data quality gate (complete numeric series only)...")
 
     def is_complete_numeric(series: pd.Series) -> bool:
+        # NOTE: pandas silently converts a Python None inside a float column
+        # to NaN when the DataFrame is built, and NaN is itself a `float`
+        # instance -- so a plain isinstance(v, float) check would wrongly
+        # treat missing values as valid data. pd.isna() catches both None
+        # and NaN explicitly.
         if len(series) != EXPECTED_MONTHS:
             return False
         for v in series:
-            if v is None or isinstance(v, (str, datetime.date, datetime.time)):
+            if isinstance(v, (str, datetime.date, datetime.time)):
+                return False
+            if pd.isna(v):
                 return False
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 continue
@@ -160,7 +167,7 @@ def exclude_benchmark_columns(df: pd.DataFrame) -> pd.DataFrame:
     one whose header was corrupted into a time-like value ('00:00:00').
     Warns if either case is found.
     """
-    print("[3/5] Checking for benchmark/index columns to exclude...")
+    print("[3/6] Checking for benchmark/index columns to exclude...")
 
     to_drop = []
     for col in df.columns:
@@ -187,7 +194,7 @@ def exclude_benchmark_columns(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 def build_correlation_matrix(returns: pd.DataFrame, out_path: str) -> pd.DataFrame:
     """Compute the Pearson correlation matrix across eligible stocks and save it."""
-    print("[4/5] Building Pearson correlation matrix...")
+    print("[4/6] Building Pearson correlation matrix...")
 
     corr = returns.corr()
     corr.to_csv(out_path)
@@ -195,3 +202,37 @@ def build_correlation_matrix(returns: pd.DataFrame, out_path: str) -> pd.DataFra
     print(f"      Correlation matrix: {corr.shape[0]} x {corr.shape[1]} stocks")
     print(f"      Saved to: {out_path}")
     return corr
+
+
+# ---------------------------------------------------------------------------
+# Stage 3: Eigenvector centrality
+# ---------------------------------------------------------------------------
+def compute_eigenvector_centrality(corr: pd.DataFrame, out_path: str, top_n: int = 7) -> pd.Series:
+    """
+    Compute eigenvector centrality on the |correlation| network (diagonal
+    zeroed), normalized to sum to 1. Saves an ascending-ranked CSV (most
+    peripheral first) and prints the top_n lowest-centrality stocks.
+    """
+    print("[5/6] Computing eigenvector centrality...")
+
+    tickers = corr.columns
+    adj = corr.abs().to_numpy()
+    np.fill_diagonal(adj, 0.0)
+
+    # Largest eigenvalue's eigenvector (adjacency is symmetric -> use eigh).
+    eigenvalues, eigenvectors = np.linalg.eigh(adj)
+    top_vector = eigenvectors[:, -1]
+    # Sign convention: eigenvector centrality should be non-negative.
+    top_vector = np.abs(top_vector)
+    centrality = top_vector / top_vector.sum()
+
+    centrality_series = pd.Series(centrality, index=tickers, name="centrality")
+    centrality_series = centrality_series.sort_values(ascending=True)
+    centrality_series.to_csv(out_path, header=True, index_label="stock")
+
+    print(f"      Saved ranked centrality (ascending) to: {out_path}")
+    print(f"      Top {top_n} most peripheral (lowest centrality) stocks:")
+    for name, score in centrality_series.head(top_n).items():
+        print(f"        {name:<40s} {score:.6f}")
+
+    return centrality_series
