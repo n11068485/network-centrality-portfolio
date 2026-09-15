@@ -1,0 +1,14 @@
+# Virtual environment
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Data files (licensed/sensitive coursework data - never commit)
+*.xlsx
+*.xls
+
+# Pipeline outputs
+*.csv
