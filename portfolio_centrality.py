@@ -22,6 +22,7 @@ import datetime
 import numpy as np
 import pandas as pd
 import openpyxl
+from scipy.sparse.csgraph import minimum_spanning_tree
 
 # ---------------------------------------------------------------------------
 # Configuration: describes the fixed layout of the "Monthly_Returns" sheet.
@@ -236,3 +237,98 @@ def compute_eigenvector_centrality(corr: pd.DataFrame, out_path: str, top_n: int
         print(f"        {name:<40s} {score:.6f}")
 
     return centrality_series
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: Minimum spanning tree cross-check
+# ---------------------------------------------------------------------------
+def compute_mst_degree(corr: pd.DataFrame, out_path: str) -> pd.Series:
+    """
+    Convert correlations to Mantegna distance (d = sqrt(2*(1-rho))), build
+    the minimum spanning tree, and return each stock's degree in the tree.
+    Saves a ranked (descending) CSV of MST degree.
+    """
+    print("[6/6] Cross-checking with minimum spanning tree (MST)...")
+
+    tickers = corr.columns
+    distance = np.sqrt(2.0 * (1.0 - corr.to_numpy()))
+    np.fill_diagonal(distance, 0.0)
+
+    mst = minimum_spanning_tree(distance)
+    mst_dense = mst.toarray()
+    # MST edges are directed by the sparse solver; symmetrize to count degree.
+    adjacency = (mst_dense > 0) | (mst_dense.T > 0)
+    degree = adjacency.sum(axis=1)
+
+    degree_series = pd.Series(degree, index=tickers, name="mst_degree")
+    degree_series = degree_series.sort_values(ascending=False)
+    degree_series.to_csv(out_path, header=True, index_label="stock")
+
+    print(f"      Saved MST degree ranking to: {out_path}")
+    return degree_series
+
+
+def validate_against_mst(centrality: pd.Series, mst_degree: pd.Series, top_n: int = 7) -> None:
+    """
+    Print how many of the top_n lowest-centrality stocks are MST leaf nodes
+    (degree 1) -- a validation check that peripheral-by-centrality stocks
+    are also peripheral-by-tree-structure.
+    """
+    top_peripheral = centrality.head(top_n).index
+    leaf_nodes = set(mst_degree[mst_degree == 1].index)
+
+    confirmed = [name for name in top_peripheral if name in leaf_nodes]
+
+    print(f"      Top {top_n} eigenvector-centrality stocks and their MST degree:")
+    for name in top_peripheral:
+        deg = mst_degree.get(name, "n/a")
+        flag = "leaf (confirmed)" if name in leaf_nodes else f"degree {deg}"
+        print(f"        {name:<40s} {flag}")
+
+    print(f"      >>> {len(confirmed)} of {top_n} confirmed by MST (leaf nodes) <<<")
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Rank stocks by eigenvector centrality to pick peripheral "
+                     "(diversifying) candidates from a monthly-returns workbook."
+    )
+    parser.add_argument(
+        "data_file",
+        nargs="?",
+        default=DEFAULT_DATA_FILE,
+        help="Path to the Excel workbook (default: looks one directory above "
+             "this script for 'EFB335 S2 2026 Group Project Data.xlsx').",
+    )
+    parser.add_argument("--top-n", type=int, default=7,
+                         help="Number of most peripheral stocks to report (default: 7).")
+    args = parser.parse_args()
+
+    print("=" * 70)
+    print("EFB335 Portfolio Construction: Eigenvector Centrality Pipeline")
+    print("=" * 70)
+
+    try:
+        raw_df, _headers = load_monthly_returns(args.data_file)
+        clean_df = apply_data_quality_gate(raw_df)
+        eligible_df = exclude_benchmark_columns(clean_df)
+        corr = build_correlation_matrix(eligible_df, "correlation_matrix.csv")
+        centrality = compute_eigenvector_centrality(
+            corr, "eigenvector_centrality_ranked.csv", top_n=args.top_n
+        )
+        mst_degree = compute_mst_degree(corr, "mst_degree_ranked.csv")
+        validate_against_mst(centrality, mst_degree, top_n=args.top_n)
+    except DataLayoutError as exc:
+        print(f"\nERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print("=" * 70)
+    print("Pipeline complete.")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
