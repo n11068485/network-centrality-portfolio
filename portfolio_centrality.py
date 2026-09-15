@@ -180,3 +180,18 @@ def exclude_benchmark_columns(df: pd.DataFrame) -> pd.DataFrame:
     result = df.drop(columns=to_drop)
     print(f"      {result.shape[1]} eligible stocks remain for analysis.")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: Correlation matrix
+# ---------------------------------------------------------------------------
+def build_correlation_matrix(returns: pd.DataFrame, out_path: str) -> pd.DataFrame:
+    """Compute the Pearson correlation matrix across eligible stocks and save it."""
+    print("[4/5] Building Pearson correlation matrix...")
+
+    corr = returns.corr()
+    corr.to_csv(out_path)
+
+    print(f"      Correlation matrix: {corr.shape[0]} x {corr.shape[1]} stocks")
+    print(f"      Saved to: {out_path}")
+    return corr
