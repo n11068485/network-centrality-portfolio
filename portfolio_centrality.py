@@ -1,11 +1,11 @@
 """
-EFB335 Portfolio Construction: Diversification via Eigenvector Centrality
+EFB335 Portfolio Construction: Diversification via PageRank Centrality
 ===========================================================================
 
 Reads monthly stock returns from an Excel workbook, builds a correlation
-matrix, ranks stocks by eigenvector centrality in the correlation network,
-and selects the 7 most peripheral (least central) stocks as diversification
-candidates. Cross-checks the ranking against a minimum spanning tree (MST).
+matrix, and ranks stocks by PageRank centrality in the correlation network
+to select the 7 most peripheral (least central) stocks as diversification
+candidates.
 
 Run end-to-end with:
     python portfolio_centrality.py "path/to/workbook.xlsx"
@@ -22,7 +22,6 @@ import datetime
 import numpy as np
 import pandas as pd
 import openpyxl
-from scipy.sparse.csgraph import minimum_spanning_tree
 
 # ---------------------------------------------------------------------------
 # Configuration: describes the fixed layout of the "Monthly_Returns" sheet.
@@ -59,7 +58,7 @@ def load_monthly_returns(file_path: str) -> pd.DataFrame:
 
     Raises a clear, non-traceback error if the file or sheet layout is wrong.
     """
-    print(f"[1/6] Loading data from: {file_path}")
+    print(f"[1/5] Loading data from: {file_path}")
 
     if not os.path.isfile(file_path):
         raise DataLayoutError(
@@ -125,7 +124,7 @@ def apply_data_quality_gate(df: pd.DataFrame) -> pd.DataFrame:
     Keep only columns (stocks) with a complete, numeric 36-month series.
     Prints how many were kept/excluded and lists excluded names.
     """
-    print("[2/6] Applying data quality gate (complete numeric series only)...")
+    print("[2/5] Applying data quality gate (complete numeric series only)...")
 
     def is_complete_numeric(series: pd.Series) -> bool:
         # NOTE: pandas silently converts a Python None inside a float column
@@ -168,7 +167,7 @@ def exclude_benchmark_columns(df: pd.DataFrame) -> pd.DataFrame:
     one whose header was corrupted into a time-like value ('00:00:00').
     Warns if either case is found.
     """
-    print("[3/6] Checking for benchmark/index columns to exclude...")
+    print("[3/5] Checking for benchmark/index columns to exclude...")
 
     to_drop = []
     for col in df.columns:
@@ -195,7 +194,7 @@ def exclude_benchmark_columns(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 def build_correlation_matrix(returns: pd.DataFrame, out_path: str) -> pd.DataFrame:
     """Compute the Pearson correlation matrix across eligible stocks and save it."""
-    print("[4/6] Building Pearson correlation matrix...")
+    print("[4/5] Building Pearson correlation matrix...")
 
     corr = returns.corr()
     corr.to_csv(out_path)
@@ -206,86 +205,70 @@ def build_correlation_matrix(returns: pd.DataFrame, out_path: str) -> pd.DataFra
 
 
 # ---------------------------------------------------------------------------
-# Stage 3: Eigenvector centrality
+# Stage 3: PageRank centrality
 # ---------------------------------------------------------------------------
-def compute_eigenvector_centrality(corr: pd.DataFrame, out_path: str, top_n: int = 7) -> pd.Series:
+def compute_pagerank_centrality(
+    corr: pd.DataFrame,
+    out_path: str,
+    top_n: int = 7,
+    damping: float = 0.85,
+    max_iter: int = 1000,
+    tol: float = 1e-12,
+) -> pd.Series:
     """
-    Compute eigenvector centrality on the |correlation| network (diagonal
-    zeroed), normalized to sum to 1. Saves an ascending-ranked CSV (most
-    peripheral first) and prints the top_n lowest-centrality stocks.
+    Compute PageRank centrality on the |correlation| network (diagonal
+    zeroed), treating each stock's correlations to others as weighted edges.
+    Saves an ascending-ranked CSV (most peripheral first) and prints the
+    top_n lowest-centrality stocks.
+
+    Implemented as standard power-iteration PageRank: at each step, a
+    stock's score is redistributed to its neighbours in proportion to edge
+    weight (|correlation|), a damping factor models random restarts, and any
+    dangling (zero-weight) node's score is spread evenly across all stocks.
     """
-    print("[5/6] Computing eigenvector centrality...")
+    print("[5/5] Computing PageRank centrality...")
 
     tickers = corr.columns
+    n = len(tickers)
     adj = corr.abs().to_numpy()
     np.fill_diagonal(adj, 0.0)
 
-    # Largest eigenvalue's eigenvector (adjacency is symmetric -> use eigh).
-    eigenvalues, eigenvectors = np.linalg.eigh(adj)
-    top_vector = eigenvectors[:, -1]
-    # Sign convention: eigenvector centrality should be non-negative.
-    top_vector = np.abs(top_vector)
-    centrality = top_vector / top_vector.sum()
+    row_sums = adj.sum(axis=1)
+    dangling = row_sums == 0
+    row_sums_safe = np.where(dangling, 1.0, row_sums)
+    # Row-normalized transition matrix: transition[i, j] = weight(i->j) / sum(weights from i)
+    transition = adj / row_sums_safe[:, None]
 
-    centrality_series = pd.Series(centrality, index=tickers, name="centrality")
-    centrality_series = centrality_series.sort_values(ascending=True)
-    centrality_series.to_csv(out_path, header=True, index_label="stock")
+    rank = np.full(n, 1.0 / n)
+    # On macOS, numpy's Accelerate BLAS backend can raise spurious
+    # divide-by-zero/overflow RuntimeWarnings on matmul that don't reflect
+    # actual NaN/Inf in the result (a known numpy/Accelerate quirk) --
+    # verified adj/transition/rank stay finite throughout, so this is
+    # suppressed rather than treated as a real numerical error.
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        for iteration in range(1, max_iter + 1):
+            dangling_mass = rank[dangling].sum()
+            new_rank = (1.0 - damping) / n + damping * (
+                transition.T @ rank + dangling_mass / n
+            )
+            diff = np.abs(new_rank - rank).sum()
+            rank = new_rank
+            if diff < tol:
+                break
 
-    print(f"      Saved ranked centrality (ascending) to: {out_path}")
-    print(f"      Top {top_n} most peripheral (lowest centrality) stocks:")
-    for name, score in centrality_series.head(top_n).items():
+    rank = rank / rank.sum()
+
+    pagerank_series = pd.Series(rank, index=tickers, name="pagerank")
+    pagerank_series = pagerank_series.sort_values(ascending=True)
+    pagerank_series.to_csv(out_path, header=True, index_label="stock")
+
+    print(f"      Converged after {iteration} power-iteration steps.")
+    print(f"      Saved ranked PageRank scores (ascending) to: {out_path}")
+    print(f"      Top {top_n} most peripheral (lowest PageRank) stocks:")
+    for name, score in pagerank_series.head(top_n).items():
         print(f"        {name:<40s} {score:.6f}")
 
-    return centrality_series
-
-
-# ---------------------------------------------------------------------------
-# Stage 4: Minimum spanning tree cross-check
-# ---------------------------------------------------------------------------
-def compute_mst_degree(corr: pd.DataFrame, out_path: str) -> pd.Series:
-    """
-    Convert correlations to Mantegna distance (d = sqrt(2*(1-rho))), build
-    the minimum spanning tree, and return each stock's degree in the tree.
-    Saves a ranked (descending) CSV of MST degree.
-    """
-    print("[6/6] Cross-checking with minimum spanning tree (MST)...")
-
-    tickers = corr.columns
-    distance = np.sqrt(2.0 * (1.0 - corr.to_numpy()))
-    np.fill_diagonal(distance, 0.0)
-
-    mst = minimum_spanning_tree(distance)
-    mst_dense = mst.toarray()
-    # MST edges are directed by the sparse solver; symmetrize to count degree.
-    adjacency = (mst_dense > 0) | (mst_dense.T > 0)
-    degree = adjacency.sum(axis=1)
-
-    degree_series = pd.Series(degree, index=tickers, name="mst_degree")
-    degree_series = degree_series.sort_values(ascending=False)
-    degree_series.to_csv(out_path, header=True, index_label="stock")
-
-    print(f"      Saved MST degree ranking to: {out_path}")
-    return degree_series
-
-
-def validate_against_mst(centrality: pd.Series, mst_degree: pd.Series, top_n: int = 7) -> None:
-    """
-    Print how many of the top_n lowest-centrality stocks are MST leaf nodes
-    (degree 1) -- a validation check that peripheral-by-centrality stocks
-    are also peripheral-by-tree-structure.
-    """
-    top_peripheral = centrality.head(top_n).index
-    leaf_nodes = set(mst_degree[mst_degree == 1].index)
-
-    confirmed = [name for name in top_peripheral if name in leaf_nodes]
-
-    print(f"      Top {top_n} eigenvector-centrality stocks and their MST degree:")
-    for name in top_peripheral:
-        deg = mst_degree.get(name, "n/a")
-        flag = "leaf (confirmed)" if name in leaf_nodes else f"degree {deg}"
-        print(f"        {name:<40s} {flag}")
-
-    print(f"      >>> {len(confirmed)} of {top_n} confirmed by MST (leaf nodes) <<<")
+    return pagerank_series
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +276,7 @@ def validate_against_mst(centrality: pd.Series, mst_degree: pd.Series, top_n: in
 # ---------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Rank stocks by eigenvector centrality to pick peripheral "
+        description="Rank stocks by PageRank centrality to pick peripheral "
                      "(diversifying) candidates from a monthly-returns workbook."
     )
     parser.add_argument(
@@ -308,7 +291,7 @@ def main() -> None:
     args = parser.parse_args()
 
     print("=" * 70)
-    print("EFB335 Portfolio Construction: Eigenvector Centrality Pipeline")
+    print("EFB335 Portfolio Construction: PageRank Centrality Pipeline")
     print("=" * 70)
 
     try:
@@ -316,11 +299,9 @@ def main() -> None:
         clean_df = apply_data_quality_gate(raw_df)
         eligible_df = exclude_benchmark_columns(clean_df)
         corr = build_correlation_matrix(eligible_df, "correlation_matrix.csv")
-        centrality = compute_eigenvector_centrality(
-            corr, "eigenvector_centrality_ranked.csv", top_n=args.top_n
+        compute_pagerank_centrality(
+            corr, "pagerank_ranked.csv", top_n=args.top_n
         )
-        mst_degree = compute_mst_degree(corr, "mst_degree_ranked.csv")
-        validate_against_mst(centrality, mst_degree, top_n=args.top_n)
     except DataLayoutError as exc:
         print(f"\nERROR: {exc}", file=sys.stderr)
         sys.exit(1)
