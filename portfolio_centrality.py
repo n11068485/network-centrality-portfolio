@@ -1,17 +1,31 @@
 """
-EFB335 Portfolio Construction: Diversification via PageRank Centrality
+Portfolio Diversification via Eigenvector Centrality
 ===========================================================================
 
 Reads monthly stock returns from an Excel workbook, builds a correlation
-matrix, and ranks stocks by PageRank centrality in the correlation network
-to select the 7 most peripheral (least central) stocks as diversification
-candidates.
+matrix, and ranks stocks by eigenvector centrality in the correlation
+network to select the 7 most peripheral (least central) stocks as
+diversification candidates.
 
 Run end-to-end with:
     python portfolio_centrality.py "path/to/workbook.xlsx"
 
-If no path is given, it looks for the workbook one directory above this
+If no path is given, it looks for 'group_project_data.xlsx' alongside this
 script (see DEFAULT_DATA_FILE below).
+
+DATA FILE
+---------
+The source workbook is not distributed with this script: it is licensed
+data and is excluded via .gitignore. To reproduce these results, place the
+workbook in the same directory as this script and rename it to
+'group_project_data.xlsx', or pass its path explicitly as an argument.
+
+The generic default filename is deliberate. The original file is named
+after the coursework it was issued for, and hard-coding that name into a
+public, version-controlled repository would make this code trivially
+discoverable by anyone searching for that coursework, which is an academic
+integrity risk for current and future cohorts. Keep the identifying name
+out of anything committed here.
 """
 
 import argparse
@@ -39,8 +53,7 @@ BENCHMARK_NAMES = {"ASX200I"}
 
 DEFAULT_DATA_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
-    "..",
-    "EFB335 S2 2026 Group Project Data.xlsx",
+    "group_project_data.xlsx",
 )
 
 
@@ -205,70 +218,37 @@ def build_correlation_matrix(returns: pd.DataFrame, out_path: str) -> pd.DataFra
 
 
 # ---------------------------------------------------------------------------
-# Stage 3: PageRank centrality
+# Stage 3: Eigenvector centrality
 # ---------------------------------------------------------------------------
-def compute_pagerank_centrality(
-    corr: pd.DataFrame,
-    out_path: str,
-    top_n: int = 7,
-    damping: float = 0.85,
-    max_iter: int = 1000,
-    tol: float = 1e-12,
-) -> pd.Series:
+def compute_eigenvector_centrality(corr: pd.DataFrame, out_path: str, top_n: int = 7) -> pd.Series:
     """
-    Compute PageRank centrality on the |correlation| network (diagonal
-    zeroed), treating each stock's correlations to others as weighted edges.
-    Saves an ascending-ranked CSV (most peripheral first) and prints the
-    top_n lowest-centrality stocks.
-
-    Implemented as standard power-iteration PageRank: at each step, a
-    stock's score is redistributed to its neighbours in proportion to edge
-    weight (|correlation|), a damping factor models random restarts, and any
-    dangling (zero-weight) node's score is spread evenly across all stocks.
+    Compute eigenvector centrality on the |correlation| network (diagonal
+    zeroed), normalized to sum to 1. Saves an ascending-ranked CSV (most
+    peripheral first) and prints the top_n lowest-centrality stocks.
     """
-    print("[5/5] Computing PageRank centrality...")
+    print("[5/5] Computing eigenvector centrality...")
 
     tickers = corr.columns
-    n = len(tickers)
     adj = corr.abs().to_numpy()
     np.fill_diagonal(adj, 0.0)
 
-    row_sums = adj.sum(axis=1)
-    dangling = row_sums == 0
-    row_sums_safe = np.where(dangling, 1.0, row_sums)
-    # Row-normalized transition matrix: transition[i, j] = weight(i->j) / sum(weights from i)
-    transition = adj / row_sums_safe[:, None]
+    # Largest eigenvalue's eigenvector (adjacency is symmetric -> use eigh).
+    eigenvalues, eigenvectors = np.linalg.eigh(adj)
+    top_vector = eigenvectors[:, -1]
+    # Sign convention: eigenvector centrality should be non-negative.
+    top_vector = np.abs(top_vector)
+    centrality = top_vector / top_vector.sum()
 
-    rank = np.full(n, 1.0 / n)
-    # On macOS, numpy's Accelerate BLAS backend can raise spurious
-    # divide-by-zero/overflow RuntimeWarnings on matmul that don't reflect
-    # actual NaN/Inf in the result (a known numpy/Accelerate quirk) --
-    # verified adj/transition/rank stay finite throughout, so this is
-    # suppressed rather than treated as a real numerical error.
-    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
-        for iteration in range(1, max_iter + 1):
-            dangling_mass = rank[dangling].sum()
-            new_rank = (1.0 - damping) / n + damping * (
-                transition.T @ rank + dangling_mass / n
-            )
-            diff = np.abs(new_rank - rank).sum()
-            rank = new_rank
-            if diff < tol:
-                break
+    centrality_series = pd.Series(centrality, index=tickers, name="centrality")
+    centrality_series = centrality_series.sort_values(ascending=True)
+    centrality_series.to_csv(out_path, header=True, index_label="stock")
 
-    rank = rank / rank.sum()
-
-    pagerank_series = pd.Series(rank, index=tickers, name="pagerank")
-    pagerank_series = pagerank_series.sort_values(ascending=True)
-    pagerank_series.to_csv(out_path, header=True, index_label="stock")
-
-    print(f"      Converged after {iteration} power-iteration steps.")
-    print(f"      Saved ranked PageRank scores (ascending) to: {out_path}")
-    print(f"      Top {top_n} most peripheral (lowest PageRank) stocks:")
-    for name, score in pagerank_series.head(top_n).items():
+    print(f"      Saved ranked centrality (ascending) to: {out_path}")
+    print(f"      Top {top_n} most peripheral (lowest centrality) stocks:")
+    for name, score in centrality_series.head(top_n).items():
         print(f"        {name:<40s} {score:.6f}")
 
-    return pagerank_series
+    return centrality_series
 
 
 # ---------------------------------------------------------------------------
@@ -276,22 +256,22 @@ def compute_pagerank_centrality(
 # ---------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Rank stocks by PageRank centrality to pick peripheral "
+        description="Rank stocks by eigenvector centrality to pick peripheral "
                      "(diversifying) candidates from a monthly-returns workbook."
     )
     parser.add_argument(
         "data_file",
         nargs="?",
         default=DEFAULT_DATA_FILE,
-        help="Path to the Excel workbook (default: looks one directory above "
-             "this script for 'EFB335 S2 2026 Group Project Data.xlsx').",
+        help="Path to the Excel workbook (default: 'group_project_data.xlsx' "
+             "alongside this script).",
     )
     parser.add_argument("--top-n", type=int, default=7,
                          help="Number of most peripheral stocks to report (default: 7).")
     args = parser.parse_args()
 
     print("=" * 70)
-    print("EFB335 Portfolio Construction: PageRank Centrality Pipeline")
+    print("Portfolio Diversification via Eigenvector Centrality")
     print("=" * 70)
 
     try:
@@ -299,8 +279,8 @@ def main() -> None:
         clean_df = apply_data_quality_gate(raw_df)
         eligible_df = exclude_benchmark_columns(clean_df)
         corr = build_correlation_matrix(eligible_df, "correlation_matrix.csv")
-        compute_pagerank_centrality(
-            corr, "pagerank_ranked.csv", top_n=args.top_n
+        compute_eigenvector_centrality(
+            corr, "eigenvector_centrality_ranked.csv", top_n=args.top_n
         )
     except DataLayoutError as exc:
         print(f"\nERROR: {exc}", file=sys.stderr)
